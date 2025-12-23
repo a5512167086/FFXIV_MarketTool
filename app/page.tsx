@@ -3,24 +3,30 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Search, Loader2, Globe } from "lucide-react"; // 加入 Globe icon
+import { Search, Loader2, Globe } from "lucide-react";
 
 // ===== Type Definitions =====
 interface MarketItem {
   id: number;
-  name: string;
+  name: string; // 這裡存 API 原本給的名稱 (通常是英文)
   iconUrl: string;
 }
 
 type PriceInfo = {
   minAll: number;
-  minAllWorld?: string; // 新增：最低價伺服器
+  minAllWorld?: string;
   minNQ: number;
-  minNQWorld?: string; // 新增：NQ 最低價伺服器
+  minNQWorld?: string;
   minHQ: number;
-  minHQWorld?: string; // 新增：HQ 最低價伺服器
+  minHQWorld?: string;
   listingsFetched: number;
   lastUploadTime?: number;
+};
+
+// items.json 的結構
+type LocalItemData = {
+  id: number;
+  name: string;
 };
 
 // ===== Config / Constants =====
@@ -59,6 +65,12 @@ export default function MarketplacePage() {
   const [allMarketableIds, setAllMarketableIds] = useState<number[]>([]);
   const [displayIds, setDisplayIds] = useState<number[]>([]);
 
+  // ===== State: Local Items (中文翻譯) =====
+  // 這裡與 API 請求脫鉤，單獨管理
+  const [localItems, setLocalItems] = useState<Record<string, LocalItemData>>(
+    {}
+  );
+
   // ===== State: Page Data =====
   const [pageItems, setPageItems] = useState<MarketItem[]>([]);
   const [isPageLoading, setIsPageLoading] = useState(false);
@@ -75,13 +87,13 @@ export default function MarketplacePage() {
 
   const gilFmt = useMemo(() => new Intl.NumberFormat("en-US"), []);
 
-  // 總頁數根據 displayIds 計算
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(displayIds.length / PAGE_SIZE));
   }, [displayIds.length]);
 
-  // ===== 1. Initial Load: Get All IDs =====
+  // ===== 1. Initial Load: IDs & Local JSON =====
   useEffect(() => {
+    // 1. 抓取可交易 ID
     async function initIds() {
       try {
         const res = await fetch("https://universalis.app/api/v2/marketable");
@@ -90,10 +102,24 @@ export default function MarketplacePage() {
         setAllMarketableIds(ids);
         setDisplayIds(ids);
       } catch (e) {
-        console.error("Init Error:", e);
+        console.error("Init IDs Error:", e);
       }
     }
+
+    // 2. 抓取本地翻譯檔 (非同步進行，不卡流程)
+    async function loadLocalItems() {
+      try {
+        const res = await fetch("/items.json");
+        if (!res.ok) throw new Error("Failed to load local items");
+        const data = await res.json();
+        setLocalItems(data);
+      } catch (e) {
+        console.error("Local items load error:", e);
+      }
+    }
+
     initIds();
+    loadLocalItems();
   }, []);
 
   // ===== 2. Search Handler =====
@@ -132,7 +158,7 @@ export default function MarketplacePage() {
     return () => clearTimeout(handler);
   }, [searchQuery, allMarketableIds]);
 
-  // ===== 3. Main Logic: Fetch Details & Prices for Current Page =====
+  // ===== 3. Main Logic: Fetch Page Data =====
   const fetchPageData = useCallback(async () => {
     if (displayIds.length === 0) {
       setPageItems([]);
@@ -158,6 +184,10 @@ export default function MarketplacePage() {
       );
       const itemData = await itemRes.json();
 
+      // 🔥 優化重點：
+      // 這裡只負責存下 API 的原始資料 (英文)，不依賴 localItems。
+      // 這樣即使 items.json 還沒載入，這段邏輯也能先跑完並顯示內容。
+      // 翻譯工作交給 Render 層 (JSX) 處理。
       const loadedItems: MarketItem[] = (itemData.rows || []).map(
         (row: any) => ({
           id: row.row_id,
@@ -167,36 +197,33 @@ export default function MarketplacePage() {
       );
 
       setPageItems(loadedItems);
-
       fetchCurrentPrices(selectedWorld, targetIds);
     } catch (e) {
       console.error("Fetch Page Data Error:", e);
     } finally {
       setIsPageLoading(false);
     }
-  }, [displayIds, page, selectedWorld]);
+  }, [displayIds, page, selectedWorld]); // 🔥 這裡移除了 localItems 依賴，避免重複呼叫 API
 
   useEffect(() => {
     fetchPageData();
   }, [fetchPageData]);
 
-  // ===== 4. Price Fetcher (Updated Logic) =====
+  // ===== 4. Price Fetcher =====
   async function fetchCurrentPrices(worldOrDc: string, itemIds: number[]) {
     if (!itemIds.length) return;
     setPriceLoading(true);
 
     try {
       const ids = itemIds.join(",");
-      // 注意：worldName 包含在 listings 裡面，所以這裡不需要改 fields
-      // 只需要確保抓回 listings 即可
       const fields = [
         "items.itemID",
         "items.lastUploadTime",
         "items.listings.pricePerUnit",
         "items.listings.hq",
-        "items.listings.worldName", // 確保 API 回傳 World Name
+        "items.listings.worldName",
       ].join(",");
-      console.log("Searching for:", worldOrDc);
+
       const url = `https://universalis.app/api/v2/${encodeURIComponent(
         worldOrDc
       )}/${ids}?listings=${LISTINGS_PER_ITEM}&entries=0&fields=${encodeURIComponent(
@@ -208,7 +235,6 @@ export default function MarketplacePage() {
       const data = await res.json();
 
       const entries = normalizeCurrentDataResponse(data);
-
       const nextMap = new Map<number, PriceInfo>();
 
       for (const it of entries) {
@@ -216,8 +242,6 @@ export default function MarketplacePage() {
         if (!itemId) continue;
 
         const listings = Array.isArray(it.listings) ? it.listings : [];
-
-        // 初始化變數
         let minAll = Infinity,
           minAllW = "";
         let minNQ = Infinity,
@@ -228,15 +252,13 @@ export default function MarketplacePage() {
         for (const l of listings) {
           const ppu = safeNum(l.pricePerUnit);
           if (!ppu) continue;
-          const wName = l.worldName || ""; // 從 listing 取得伺服器名稱
+          const wName = l.worldName || "";
 
-          // 1. 找全品質最低
           if (ppu < minAll) {
             minAll = ppu;
             minAllW = wName;
           }
 
-          // 2. 分品質比較
           if (l.hq) {
             if (ppu < minHQ) {
               minHQ = ppu;
@@ -304,9 +326,7 @@ export default function MarketplacePage() {
               <select
                 className="h-10 rounded-md border border-input bg-background px-3 text-sm focus:ring-2 focus:ring-ring"
                 value={selectedWorld}
-                onChange={(e) => {
-                  setSelectedWorld(e.target.value);
-                }}
+                onChange={(e) => setSelectedWorld(e.target.value)}
               >
                 <option value="陸行鳥">DC: 陸行鳥 (比價)</option>
                 <option disabled>──────────</option>
@@ -376,6 +396,10 @@ export default function MarketplacePage() {
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
             {pageItems.map((item) => {
               const p = priceMap.get(item.id);
+              // 🔥 優化重點：在 Render 時即時查表
+              // 當 localItems 更新時，這裡會自動重新計算，讓 UI 瞬間變成中文
+              const translatedName = localItems[String(item.id)]?.name;
+
               return (
                 <MarketItemCard
                   key={item.id}
@@ -384,6 +408,7 @@ export default function MarketplacePage() {
                   gilFmt={gilFmt}
                   loading={priceLoading}
                   selectedWorld={selectedWorld}
+                  localName={translatedName} // 傳入本地翻譯
                 />
               );
             })}
@@ -421,24 +446,27 @@ export default function MarketplacePage() {
   );
 }
 
-// ===== Sub Component: Card (效能優化與整潔) =====
+// ===== Sub Component: Card =====
 function MarketItemCard({
   item,
   price,
   gilFmt,
   loading,
   selectedWorld,
+  localName, // 接收翻譯名稱
 }: {
   item: MarketItem;
   price?: PriceInfo;
   gilFmt: Intl.NumberFormat;
   loading: boolean;
   selectedWorld: string;
+  localName?: string;
 }) {
-  // 判斷是否為跨服 DC 模式 (陸行鳥)
   const isDCMode = selectedWorld === "陸行鳥";
 
-  // 渲染價格的輔助函式
+  // 🔥 優先顯示翻譯名稱，若無則顯示 item.name (英文)
+  const displayName = localName || item.name;
+
   const renderPriceRow = (
     label: string,
     value: number,
@@ -459,7 +487,6 @@ function MarketItemCard({
           >
             {hasPrice ? gilFmt.format(value) : "-"}
           </span>
-          {/* 如果是 DC 模式且有價格，顯示伺服器名稱 */}
           {isDCMode && hasPrice && world && (
             <span className="ml-1 text-[10px] text-muted-foreground bg-secondary px-1 py-0.5 rounded">
               {world}
@@ -473,12 +500,11 @@ function MarketItemCard({
   return (
     <Card className="group overflow-hidden hover:shadow-lg transition-all duration-200 hover:border-primary/50">
       <div className="p-3">
-        {/* Header: Icon + Name */}
         <div className="flex items-start gap-3 mb-3">
           <div className="relative w-12 h-12 shrink-0 rounded bg-secondary overflow-hidden border border-border">
             <img
               src={item.iconUrl}
-              alt={item.name}
+              alt={displayName}
               className="w-full h-full object-cover"
               loading="lazy"
               onError={(e) => {
@@ -487,8 +513,9 @@ function MarketItemCard({
             />
           </div>
           <div className="min-w-0">
+            {/* 顯示最終名稱 */}
             <h3 className="font-medium text-sm text-foreground line-clamp-2 leading-tight">
-              {item.name}
+              {displayName}
             </h3>
             <p className="text-[10px] text-muted-foreground mt-1 font-mono">
               ID: {item.id}
@@ -496,9 +523,7 @@ function MarketItemCard({
           </div>
         </div>
 
-        {/* Price Info */}
         <div className="bg-muted/50 rounded p-2 space-y-1.5">
-          {/* 1. NQ 價格 */}
           {renderPriceRow(
             "NQ",
             price?.minNQ ?? 0,
@@ -508,7 +533,6 @@ function MarketItemCard({
               : ""
           )}
 
-          {/* 2. HQ 價格 */}
           {renderPriceRow(
             "HQ",
             price?.minHQ ?? 0,
@@ -516,7 +540,6 @@ function MarketItemCard({
             "text-amber-600 dark:text-amber-400"
           )}
 
-          {/* Footer Info */}
           <div className="pt-2 mt-1 border-t border-border/50 flex justify-between items-center text-[10px] text-muted-foreground">
             <span className="flex items-center gap-1">
               {isDCMode ? <Globe className="h-3 w-3" /> : null}
